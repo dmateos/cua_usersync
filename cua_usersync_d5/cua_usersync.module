@@ -1,0 +1,232 @@
+<?
+/* This doesnt exsist in d5, now it does! */
+function drupal_http_build_query(array $query, $parent = '') {
+	$params = array();
+
+	foreach ($query as $key => $value) {
+		$key = ($parent ? $parent . '[' . rawurlencode($key) . ']' : rawurlencode($key));
+		if (is_array($value)) {
+			$params[] = drupal_http_build_query($value, $key);
+		}
+		elseif (!isset($value)) {
+			 $params[] = $key;
+		}
+		else {
+		$params[] = $key . '=' . str_replace('%2F', '/', rawurlencode($value));
+		}
+	  }
+
+  return implode('&', $params);
+}
+
+function cua_usersync_menu($may_cache) {
+	$items = array();
+
+	if(!$may_cache) {
+		$items[] = array(
+			'path' => 'usersync',
+			'title' => 'User sync slave endpoint',
+			'callback' => 'cua_usersync_endpoint',
+			'access' => cua_usersync_endpoint_access(),
+			'type' => MENU_CALLBACK,
+		);
+	}
+	return $items;
+}
+
+function cua_usersync_get_master_uid($user) {
+	$key = variable_get('bakery_key', "");
+	$murl = variable_get("cuausync_url", "");
+
+	$payload = array(
+		"timestamp" => $_SERVER["REQUEST_TIME"],
+		"data" => array(
+			"mail" => $user->mail,
+		),
+	);
+	$payload['signature'] = hash_hmac("sha256", $payload['data']['mail'].'/'.$payload["timestamp"], $key);
+	$payload = drupal_http_build_query(array('oreo' => bakery_mix(serialize($payload), 1)));
+
+	$curl = curl_init();
+
+	curl_setopt_array($curl, array(
+		CURLOPT_POST => true, 
+		CURLOPT_URL => $murl . "/request_id",
+		CURLOPT_POSTFIELDS => $payload,
+		CURLOPT_HTTPHEADER => array('Content-Type: application/x-www-form-urlencoded; charset=utf-8'),
+		CURLOPT_RETURNTRANSFER => true, 
+		CURLOPT_CONNECTTIMEOUT => 10, 
+		CURLOPT_TIMEOUT => 20,
+	));
+
+	if($result = curl_exec($curl)) {
+		$http_status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+		if($http_status == 200) {
+			return $result;
+		}
+	} else {
+		drupal_set_message($http_status);
+	}	
+}
+
+function cua_usersync_endpoint_access() {
+        if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['usersync'])) {
+                $payload = unserialize(bakery_mix($_POST['usersync'], 0));
+                $key = variable_get('bakery_key', '');
+                $signature = hash_hmac('sha256', $payload['data']['old_email'].'/'.$payload['timestamp'], $key);
+
+                if($signature == $payload['signature'] &&
+                        $payload['timestamp'] + variable_get('bakery_freshness', '3600') >= $_SERVER['REQUEST_TIME'])
+                {
+                        return true;
+                }
+        }
+        return false;
+}
+
+/* Stops the civi hooks from running for this module if we plan on doing some stuff in the function bellow since that would
+   cause a loop with the other server. */
+$GLOBALS["civihook_dontrun"] = false;
+
+// master user name/email change -> slave endpoint
+function cua_usersync_endpoint() {
+	$key = variable_get('bakery_key', '');
+	$payload = unserialize(bakery_mix($_POST['usersync'], 0));
+	$message = "";
+
+	$user = user_load(array(
+		"mail" => $payload['data']['old_email'],
+		"name" => $payload['data']['old_name'],
+	));
+
+	if(!$user) {
+		echo "user matching old name and email not found";
+		return; 
+	}
+
+	if($payload['data']['old_email'] != $payload['data']['new_email'] && !empty($payload['data']['new_email'])) {
+		$GLOBALS["civihook_dontrun"] = true;
+		if(user_save($user, array("mail" => $payload['data']['new_email']))) {
+			$civiUID = CRM_Core_BAO_UFMatch::getContactId($user->uid);
+			//$civiMAIL = CRM_Contact_BAO_Contact::getEmailDetails($civiUID);
+			if(CRM_Utils_Rule::email($payload['data']['new_email'])) {
+				require_once 'CRM/Core/BAO/UFMatch.php';
+				CRM_Core_BAO_UFMatch::updateContactEmail($civiUID, $payload['data']['new_email']);
+				organization_service_call($civiUID);
+			}
+			echo "OK";
+		} else {
+			echo "could not save user object";
+		}
+	}
+
+	if($payload['data']['old_name'] != $payload['data']['new_name'] && !empty($payload['data']['new_name'])) {
+		if(user_save($user, array("name" => $payload['data']['new_name']))) {
+			echo "OK";
+		} else {
+			echo "could not save user object";
+		}
+		return;
+	}
+	//echo "did nothing";
+	return;
+}
+
+/* Use this to share data between the pre and post hook.
+   i assume this is ok? */
+global $userobj;
+$userobj = null;
+
+//Sync civicrm email changes to the master.
+// slave civicrm -> master endpoint
+function cua_usersync_civicrm_pre($op, $oname, $oid, $oref) {
+	if($GLOBALS["civihook_dontrun"])
+		return;
+	global $userobj;
+	if($op == "edit" && $oname == "Organization") {
+		//Grab the old values from civicrm.
+		require_once("api/v2/Contact.php");
+		$params_old = array(
+			'contact_id' => $oref["contact_id"],
+			'return.email' => TRUE,
+		);
+		$org_old = civicrm_contact_get($params_old);
+		$old_email = $org_old["email"];
+		$userobj = array("old_email" => $old_email);
+	}
+}
+
+/* Do the actual update in the post hook as this only get runs if civicrm actually manages
+   to update the email. */
+function cua_usersync_civicrm_post($op, $objectName, $objectID, &$objectRef) {
+	if($GLOBALS["civihook_dontrun"])
+		return;
+	global $userobj;
+	if($op == "edit" && $objectName == 'Organization') {
+		if($userobj == null) {
+			drupal_set_message("pre hook did not set userobject", "error");
+			return;
+		}
+
+		$old_email = $userobj["old_email"];
+		$new_email = $objectRef->location['email'][0]->email;
+
+		if($old_email == $new_email)
+			return;
+
+		//TODO: hrm when a new user is created this edit is trigured with this as empty..
+		if($new_email == "")
+			return;
+
+		$murl = variable_get("cuausync_url", "");
+		//Build the payload to send to the master.
+		$key = variable_get("bakery_key", "");
+		$payload = array(
+			'timestamp' => $_SERVER['REQUEST_TIME'],
+			'data' => array (
+				"old_email" => $old_email,
+				"new_email" => $new_email,
+			),
+		);
+		$payload['signature'] = hash_hmac('sha256', $payload['data']['old_email'].'/'.$payload['timestamp'], $key);
+		$payload = drupal_http_build_query(array('usersync' => bakery_mix(serialize($payload), 1)));
+
+		$curl = curl_init();
+		curl_setopt_array($curl, array(
+			CURLOPT_POST => true, 
+			CURLOPT_URL => $murl . "/usersync", //tood get the master programatically
+			CURLOPT_POSTFIELDS => $payload,
+			CURLOPT_HTTPHEADER => array('Content-Type: application/x-www-form-urlencoded; charset=utf-8'),
+			CURLOPT_RETURNTRANSFER => true, 
+			CURLOPT_CONNECTTIMEOUT => 10, 
+			CURLOPT_TIMEOUT => 20,
+		));
+
+		//may as well check the http auth too. 
+		//todo: we didnt make d5 bakery do this. 
+		if($userpw = variable_get('bakery_slave_httpauth_credentials', '')) {
+			curl_setopt_array($curl, array(
+				CURLOPT_USERPWD => $userpwd,
+			));
+		}
+
+		if($result = curl_exec($curl)) {
+			$http_status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+			if($http_status == 200) {
+				if($result == 'OK') {
+					drupal_set_message("CIVICRM has been synced with CUA");
+				} else {
+					drupal_set_message($result ." contact CU support", "error");
+				}
+			} else {
+				drupal_set_message("Could not sync civicrm email with the master, contact CU support: $http_status", "error");
+			}
+		} else {
+			drupal_set_message("Could not talk with master to sync email, contact CU support", "error");
+		}
+		curl_close($curl);
+	} 
+}
+
+
+?>

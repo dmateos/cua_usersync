@@ -1,0 +1,5 @@
+name = CUA User Sync
+description = ""
+core = 7.x
+version = "7.0"
+

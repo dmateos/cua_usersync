@@ -1,0 +1,165 @@
+<?
+function cua_usersync_menu() {
+	$items = array();
+
+	$items["usersync"] = array(
+		'title' 	=> "User sync endpoint",
+		'description' 	=> 'description',
+		'page callback' => 'cua_usersync_endpoint',
+		'access callback' => 'cua_usersync_endpoint_access',
+		'type' 		=> MENU_CALLBACK,
+		'weight'  	=> 100,
+	);
+
+	$items["request_id"] = array(
+		'title'		=> "Request master id",
+		'description' 	=> 'description',
+		'page callback' => 'cua_usersync_masterid_endpoint',
+		'access callback' => 'cua_usersync_masterid_endpoint_access',
+		'type'		=> MENU_CALLBACK,
+		'weight' 	=> 10,
+	);
+	return $items;
+}
+
+function cua_usersync_masterid_endpoint_access() {
+       if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['oreo'])) {
+                $payload = unserialize(bakery_mix($_POST["oreo"], 0));
+                $key = variable_get('bakery_key', '');
+                $signature = hash_hmac('sha256', $payload['data']['mail'].'/'.$payload['timestamp'], $key);
+
+                if($signature == $payload['signature'] &&
+                        $payload['timestamp'] + variable_get('bakery_freshness', '3600') >= $_SERVER['REQUEST_TIME'])
+                {
+                        return true;
+                }
+        }
+       return false;
+}
+
+function cua_usersync_masterid_endpoint() {
+        $key = variable_get('bakery_key', '');
+        $cookie = unserialize(bakery_mix($_POST['oreo'], 0));
+        $master_uid = db_query("SELECT uid FROM {users} WHERE mail = ?", array($cookie['data']['mail']))->fetchField();
+	echo $master_uid;
+}
+
+function cua_usersync_endpoint_access() {
+	if($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['usersync'])) {
+		$payload = unserialize(bakery_mix($_POST['usersync'], 0));
+		$key = variable_get('bakery_key', '');
+		$signature = hash_hmac('sha256', $payload['data']['old_email'].'/'.$payload['timestamp'], $key);
+
+		if($signature == $payload['signature'] &&
+			$payload['timestamp'] + variable_get('bakery_freshness', '3600') >= $_SERVER['REQUEST_TIME'])
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Stops the userhook from running for this module if this module it self is doing something that will
+   execute the userhook as since this request comes from the other server trying to hook update it is a loop. */
+$GLOBALS["userhook_dontrun"] = false;
+
+function cua_usersync_endpoint() {
+	$key = variable_get('bakery_key', '');
+	$payload = unserialize(bakery_mix($_POST['usersync'], 0));
+
+	//Grab the user we want to change based on the old email given. 
+	$user = user_load_by_mail($payload['data']['old_email']);	
+	if(!$user) {
+		echo "user matchong old_email not found in master db";
+		return;
+	}
+
+	if(empty($payload['data']['new_email'])) {
+		return;
+	}
+
+	/* This new email could conflict with one already in the database as we didnt import
+	   exsisting cua users to donortec. */
+	$conflict = db_query('SELECT uid,name FROM users WHERE mail = :old', 
+				array(":old" => $payload['data']['new_email']))->fetchField();
+	if($conflict) {
+		echo "new email conflicts with an exsisting email in master db";
+		return;
+	}
+
+	/* If we reach this were all good probably so update the user. */
+	//$ok = db_update('users')->fields(array("mail" => $payload['data']['new_email']))
+	//			->condition('mail', $payload['data']['old_email'])->execute();
+	$GLOBALS["userhook_dontrun"] = true;
+	$ok = user_save($user, array("mail" => $payload['data']['new_email']));
+
+	//unfortunatly this trigures the user_update hook which we use for the other end
+ 	//of syncing, ok aslong as we dont use the hooks bellow. 
+	//$ok = user_save($user, array("mail" => $payload['data']['new_email']));
+
+	if($ok) {
+		echo "OK";
+	} else {
+		echo "Could not save new user data to master db";
+	}
+}
+
+function cua_usersync_user_update(&$edit, $account, $category) {
+	if($GLOBALS["userhook_dontrun"])
+		return;
+
+	$new_name = false;
+	$new_mail = false;
+	$key = variable_get('bakery_key', "");
+
+	if($account->name != $account->original->name)
+		$new_name = true;
+	if($account->mail != $account->original->mail)
+		$new_mail = true;
+
+	if($new_name != true && $new_mail != true)
+		return;
+
+	$surl = variable_get("cuausync_url", "");
+	$surl = "http://www.connectingup.org/donations";
+	$payload = array(
+		'timestamp' => $_SERVER['REQUEST_TIME'],
+		'data' => array(
+			"old_name" => $account->original->name,
+			"old_email" => $account->original->mail,
+			"new_name" => $new_name ? $account->name : false,
+			"new_email" => $new_mail ? $account->mail : false,
+		),
+	);
+	$payload['signature'] = hash_hmac('sha256', $payload['data']['old_email'].'/'.$payload['timestamp'], $key);
+	$payload = drupal_http_build_query(array('usersync' => bakery_mix(serialize($payload), 1)));
+
+	$curl = curl_init();
+	curl_setopt_array($curl, array(
+		CURLOPT_POST => true, 
+		CURLOPT_URL => $surl . "/usersync",
+		CURLOPT_POSTFIELDS => $payload,
+		CURLOPT_HTTPHEADER => array('Content-Type : application/x-www-form-urlencoded; charset=uft-8'),
+		CURLOPT_RETURNTRANSFER => true,
+		CURLOPT_CONNECTTIMEOUT => 10,
+		CURLOPT_TIMEOUT => 20,
+		CURLOPT_FOLLOWLOCATION => TRUE,
+	));
+
+	if($result = curl_exec($curl)) {
+		$http_status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+		if($http_status == 200) {
+			if($result == 'OK' || $result == "OKOK") {
+				drupal_set_message("User has been synced with DonorTec");
+			} else {
+				drupal_set_message($result ." contact CU support", "error");
+			} 
+		} else {
+			drupal_set_message("Could not update user contact CU support: $http_status", "error");
+		}
+	} else {
+		drupal_set_message("Could not talk to donortec, contact CU support", "error");
+	}
+	curl_close($curl);
+} 
+?>
